@@ -1,4 +1,7 @@
 #include <iostream>
+#include <time.h>
+#include <stdlib.h>
+#include <math.h>
 #include "vc_nodes.h"
 
 using namespace std;
@@ -12,8 +15,12 @@ int VCNodes::GetNodeID(){
   return _node_id;
 }
 
-VCManager::VCManager(int node_id):VCNodes(node_id){
-  _num_datanodes = 1000;
+VCManager::VCManager(int node_id, int num_datanode, DataNodeSelectMode dns):VCNodes(node_id){
+  _num_datanodes = num_datanode;
+  _dn_softstate_time = 60*15;//15minutes
+//  srand ( time(NULL) );
+  srand(0);
+  _datanode_selection_crit = dns;
 }
 
 bool VCManager::CreateNode(int cur_time, int node_id){
@@ -31,22 +38,43 @@ bool VCManager::AddNodes(Time cur_time, int node_id){
     vector<int>* alive_nodes = _alive_res.count(cur_time)==0?new vector<int>:_alive_res[cur_time];
     alive_nodes->push_back(node_id);
     _alive_res[cur_time] = alive_nodes;
+   
     _worker_registered_time[node_id] = cur_time;  
     bool result = worker->UpdateCurSessionTime(cur_time);
     if(result == false){
       cout << "worker->UpdateCurSessionTime returned false " << cur_time << " : " << node_id << endl;
     }
+    
+    float frac = worker->GetOnlyPriorAvailFrac();
+    int paf_key = ceil(frac*100);
+    map<int, Time>* pa_lists = _prior_avail_frac.count(paf_key)==0?new map<int, Time>():_prior_avail_frac[paf_key];
+    pa_lists->insert(pair<int, Time>(node_id, cur_time));
+    _prior_avail_frac[paf_key] = pa_lists;
+
     return true;
   }
   return false;
 }
+
 bool VCManager::RemoveNodes(Time cur_time, int node_id){
   VCWorker* worker = _id_vcworker_map[node_id];
   Time rt = _worker_registered_time.count(node_id)==0?0:_worker_registered_time[node_id];
   vector<int>* node_vector = _alive_res.count(rt)!=0?_alive_res[rt]:NULL;
   if (node_vector == NULL){
-    cout << "why node vector is null time " <<cur_time << " node_id = " << node_id << endl;
+ //   cout << "why node vector is null time " <<cur_time << " node_id = " << node_id << endl;
     return false;
+  }
+  float frac = worker->GetOnlyPriorAvailFrac();
+  int paf_key = ceil(frac*100);
+  if(_prior_avail_frac.count(paf_key)!=0){
+    map<int, Time>* pa_lists = _prior_avail_frac[paf_key];
+    if(pa_lists->count(node_id) != 0){
+      pa_lists->erase(node_id);   
+    }else{
+      cout <<"why this happens??"<< endl;
+    }
+  }else{
+    cout <<" oh well it should not happen" << endl;
   }
   int nvs = node_vector->size();
   for (int i=0;i<nvs;++i){
@@ -95,6 +123,29 @@ bool VCManager::IfNodeAlive(int node_id){
   return false;
 }
 
+int VCManager::UpdateDataNodeTime(Time cur_time){  //Called when a node is removed
+  map<int, Time>::iterator dn_it;
+  vector<int> remove_cand;
+  for(dn_it=_data_node_list.begin();dn_it!=_data_node_list.end();++dn_it){
+    VCWorker* vcw = _id_vcworker_map[dn_it->first];
+    if (vcw->CheckIfAlive() == true){
+      dn_it->second = cur_time;
+    }else{
+      Time age = cur_time - dn_it->second;
+      if(age >= _dn_softstate_time){
+        remove_cand.push_back(dn_it->first);
+      }
+    }
+  }
+  int del_num = remove_cand.size();
+  for(int i=0;i<del_num;++i){
+    VCWorker* vcw = _id_vcworker_map[remove_cand[i]];
+    vcw->UnsetDataNode();
+    _data_node_list.erase(remove_cand[i]);
+  }
+  return RecruitDataNodes(_num_datanodes-_data_node_list.size(), cur_time);
+}
+
 int VCManager::GetCndNumNodes(int cur_time, int uptime, float ava_rate){
   map<Time, vector<int>* >::iterator ani;
   int total_num = 0, satisfy = 0;
@@ -111,14 +162,92 @@ int VCManager::GetCndNumNodes(int cur_time, int uptime, float ava_rate){
     }
     total_num += node_vector->size();
   }
-  cout << " total node number = " << total_num << " condition satisfy = " << satisfy << endl;
+  cout << "\t" << total_num << "\t" << satisfy << endl;
   return satisfy;
+}
+
+int VCManager::RecruitDataNodes(Time cur_time){
+  return RecruitDataNodes(_num_datanodes-_data_node_list.size(), cur_time);
+}
+int VCManager::RecruitDataNodes(int how_many, Time cur_time){
+  int added_dn = 0;
+  while(added_dn < how_many && added_dn < _worker_registered_time.size() && _data_node_list.size() < _worker_registered_time.size()){
+    int ret = -1;
+    switch(_datanode_selection_crit){
+      case DNS_RAND:
+        ret = SelectRandom(cur_time);
+        break;
+      case DNS_PREV_AVA:
+        break;
+      case DNS_RUNTIME:
+        ret = AddOldest(cur_time);
+        break;
+      case DNS_BOTH:
+        break;
+    }
+    if (ret > 0){
+      ++added_dn;
+    }
+  }
+  return added_dn;
+}
+
+bool VCManager::AddToDataNode(int node_id, Time cur_time){
+  _data_node_list.insert(pair<int, Time>(node_id, cur_time));
+  VCWorker* vcw = _id_vcworker_map[node_id];
+  vcw->SetAsDataNode();
+}
+
+bool VCManager::CheckIfDataNode(int node_id){
+  VCWorker* vcw = _id_vcworker_map[node_id];
+  return vcw->CheckIfDataNode();
+}
+
+int VCManager::SelectRandom(int cur_time){
+  int cand_id = rand()%_worker_registered_time.size();
+  map<int, Time>::iterator wrt_it = _worker_registered_time.begin();
+  advance(wrt_it, cand_id);
+  if (_data_node_list.count(wrt_it->first) == 0){
+    AddToDataNode(wrt_it->first, cur_time);
+    return wrt_it->first;
+  }
+  return -1;
+}
+
+int VCManager::AddOldest(Time cur_time){
+  if(_data_node_list.size()!=0&&_worker_registered_time.count(_data_node_list.rbegin()->first) == 0){
+    cout << " what???" << endl;
+    return -1;
+  }
+  Time the_youngest_node_time=_data_node_list.size()>0&&_worker_registered_time.count(_data_node_list.rbegin()->first)!=0?_worker_registered_time[(_data_node_list.rbegin()->first)]:0;
+  map<Time, vector<int>* >::iterator an_it = the_youngest_node_time>0?_alive_res.lower_bound(the_youngest_node_time):_alive_res.begin();
+  while(an_it != _alive_res.end()){
+    vector<int>* nlists = an_it->second;
+    for(int i=0;i<nlists->size();++i){
+      int tid = nlists->at(i);
+      if (_data_node_list.count(tid) == 0){
+        AddToDataNode(tid, cur_time);
+        return tid;
+      }      
+    }
+    ++an_it;
+  }
+  return -1;
+}
+
+int VCManager::AddHighAvailRateNodes(Time cur_time){
+  return 1;
 }
 
 VCWorker::VCWorker(int node_id, Time first_shown_time) : VCNodes(node_id){
   _avail_time = 0;
   _this_session_uptime = 0;
   _first_shown_time = first_shown_time;
+  _is_data_node = false;
+}
+
+bool VCWorker::CheckIfDataNode(){
+  return _is_data_node;
 }
 
 bool VCWorker::CumulateUptime(Time cur_time){  //should be called when leaving a session
@@ -145,6 +274,10 @@ float VCWorker::GetPrevAvailFrac(Time cur_time){
   return (float)(_avail_time + (cur_time-_this_session_uptime))/(float)(cur_time-_first_shown_time);
 }
 
+float VCWorker::GetOnlyPriorAvailFrac(){
+  return (_this_session_uptime-_first_shown_time==0)?0.0:(float)(_avail_time)/(float)(_this_session_uptime-_first_shown_time);
+}
+
 Time VCWorker::GetCurUptime(Time cur_time){
   if (_this_session_uptime == 0 || cur_time < _this_session_uptime){
     return -1;
@@ -156,7 +289,17 @@ Time VCWorker::GetCurUptime(Time cur_time){
 Time VCWorker::GetCurSessionBeginTime(){
   return _this_session_uptime;
 }
+
 bool VCWorker::SetAsDataNode(){
   _is_data_node = true;
-  return false;
+  return true;
+}
+
+bool VCWorker::UnsetDataNode(){
+  _is_data_node = false;
+  return true;
+}
+
+bool VCWorker::CheckIfAlive(){
+  return (_this_session_uptime!=0);
 }

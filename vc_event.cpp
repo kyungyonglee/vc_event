@@ -7,10 +7,10 @@
 
 using namespace std;
 using namespace VCHadoop;
-VCEvent::VCEvent(Time begin_time, Time end_time){
+VCEvent::VCEvent(Time begin_time, Time end_time, int num_datanode, DataNodeSelectMode dns){
   _begin_time = begin_time;
   _end_time = end_time;
-  _manager = new VCManager(-1);
+  _manager = new VCManager(-1, num_datanode, dns);
 }
 
 void VCEvent::BuildEventQueue(string join_event, string leave_event){
@@ -45,7 +45,8 @@ void VCEvent::FillEventQueue(bool is_join, string filename){
   }
 }
 
-void VCEvent::Run(){
+void VCEvent::Run(Time test_begin_time, Time test_end_time){
+  int total_dn_trans = 0;
   for (Time t=_begin_time;t<_end_time;++t){
     bool jdone = false, ldone = false;
     while(jdone==false || ldone==false){
@@ -60,13 +61,23 @@ void VCEvent::Run(){
         ldone = true;
       }
     }
+    if (t<test_end_time && t>test_begin_time && ldone == true){
+      total_dn_trans += UpdateDataNode(t);
+    }
+    if(t == test_begin_time){
+      _manager->RecruitDataNodes(t);
+    }
     if (t%100000 == 0){
  //     cout << "number of alive nodes at " << t << " = " << _manager->GetAliveNodeNum() << endl;
-      cout << "current time = " << t;
+      cout << t << "\t" << total_dn_trans;
       _manager->GetCndNumNodes(t, 36000, 0.95);
     }
   }
-  cout << "number of alive nodes = " << _manager->GetAliveNodeNum() << endl;
+//  cout << "total_dn_trans = " << total_dn_trans << endl;
+}
+
+int VCEvent::UpdateDataNode(Time current_time){
+  return _manager->UpdateDataNodeTime(current_time);
 }
 
 bool VCEvent::FireJoinEvent(Time current_time){
