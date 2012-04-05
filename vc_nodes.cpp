@@ -21,6 +21,8 @@ VCManager::VCManager(int node_id, int num_datanode, DataNodeSelectMode dns):VCNo
 //  srand ( time(NULL) );
   srand(0);
   _datanode_selection_crit = dns;
+  _high_avail_threshold = 0.95;
+  InitializeAgeAvailStat();
 }
 
 bool VCManager::CreateNode(int cur_time, int node_id){
@@ -162,7 +164,8 @@ int VCManager::GetCndNumNodes(int cur_time, int uptime, float ava_rate){
     }
     total_num += node_vector->size();
   }
-  cout << "\t" << total_num << "\t" << satisfy << endl;
+  cout << "\t" << total_num << "\t" << satisfy << "\t" << _least_avail_rate<< "\t" << _youngest_age << endl;
+  InitializeAgeAvailStat();
   return satisfy;
 }
 
@@ -178,11 +181,13 @@ int VCManager::RecruitDataNodes(int how_many, Time cur_time){
         ret = SelectRandom(cur_time);
         break;
       case DNS_PREV_AVA:
+        ret = AddHighAvailRateNodes(cur_time);
         break;
       case DNS_RUNTIME:
-        ret = AddOldest(cur_time);
+        ret = AddOldest(cur_time, 0.0);
         break;
       case DNS_BOTH:
+        ret = AddOldest(cur_time, _high_avail_threshold);
         break;
     }
     if (ret > 0){
@@ -196,6 +201,8 @@ bool VCManager::AddToDataNode(int node_id, Time cur_time){
   _data_node_list.insert(pair<int, Time>(node_id, cur_time));
   VCWorker* vcw = _id_vcworker_map[node_id];
   vcw->SetAsDataNode();
+  UpdateAgeAvailStat(cur_time, node_id);
+  return true;
 }
 
 bool VCManager::CheckIfDataNode(int node_id){
@@ -214,18 +221,33 @@ int VCManager::SelectRandom(int cur_time){
   return -1;
 }
 
-int VCManager::AddOldest(Time cur_time){
-  if(_data_node_list.size()!=0&&_worker_registered_time.count(_data_node_list.rbegin()->first) == 0){
-    cout << " what???" << endl;
-    return -1;
+int VCManager::AddOldest(Time cur_time, float avail_threshold){
+  Time the_youngest_node_time = 0;
+  if(_data_node_list.size()!=0 && avail_threshold==0.0){    
+    map<int,Time>::reverse_iterator yan_it;
+    for(yan_it=_data_node_list.rbegin();yan_it!=_data_node_list.rend();++yan_it){
+      if(_worker_registered_time.count(yan_it->first) != 0){
+        the_youngest_node_time = _worker_registered_time[yan_it->first];
+        break;
+      }
+    }
+    if(the_youngest_node_time == 0){
+      cout << " what???" << endl;
+      return -1;
+    }
   }
-  Time the_youngest_node_time=_data_node_list.size()>0&&_worker_registered_time.count(_data_node_list.rbegin()->first)!=0?_worker_registered_time[(_data_node_list.rbegin()->first)]:0;
   map<Time, vector<int>* >::iterator an_it = the_youngest_node_time>0?_alive_res.lower_bound(the_youngest_node_time):_alive_res.begin();
   while(an_it != _alive_res.end()){
     vector<int>* nlists = an_it->second;
     for(int i=0;i<nlists->size();++i){
       int tid = nlists->at(i);
       if (_data_node_list.count(tid) == 0){
+        if (avail_threshold>0.0){
+          VCWorker* vcw = _id_vcworker_map[tid];
+          if (vcw->GetOnlyPriorAvailFrac() < avail_threshold){
+            continue;
+          }
+        }
         AddToDataNode(tid, cur_time);
         return tid;
       }      
@@ -236,7 +258,36 @@ int VCManager::AddOldest(Time cur_time){
 }
 
 int VCManager::AddHighAvailRateNodes(Time cur_time){
-  return 1;
+  map<int, map<int, Time>* >::reverse_iterator par_it;
+  
+  for(par_it=_prior_avail_frac.rbegin();par_it!=_prior_avail_frac.rend();++par_it){
+    map<int, Time>* nodelist = par_it->second;
+    map<int,int> temp_buf;
+    while(temp_buf.size() != nodelist->size()){
+      map<int, Time>::iterator mnl_it = nodelist->begin();
+      advance(mnl_it, rand()%nodelist->size());
+      if(_data_node_list.count(mnl_it->first) == 0){
+        AddToDataNode(mnl_it->first, cur_time);
+        return mnl_it->first;
+      }else{
+        temp_buf[mnl_it->first]=1;
+      }
+    }
+  }
+  return -1;
+}
+
+void VCManager::UpdateAgeAvailStat(Time cur_time, int node_id){
+  VCWorker* vcw = _id_vcworker_map[node_id];
+  Time cur_uptime = vcw->GetCurUptime(cur_time);
+  float prev_avail_rate = vcw->GetOnlyPriorAvailFrac();
+  _least_avail_rate = prev_avail_rate < _least_avail_rate ? prev_avail_rate : _least_avail_rate;
+  _youngest_age = cur_uptime < _youngest_age?cur_uptime:_youngest_age;
+}
+
+void VCManager::InitializeAgeAvailStat(){
+  _youngest_age = 999999999;
+  _least_avail_rate = 2.0;
 }
 
 VCWorker::VCWorker(int node_id, Time first_shown_time) : VCNodes(node_id){

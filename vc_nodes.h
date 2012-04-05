@@ -53,8 +53,10 @@ namespace VCHadoop{
       int UpdateDataNodeTime(Time cur_time);
       bool AddToDataNode(int node_id, Time cur_time);
       int SelectRandom(int cur_time);
-      int AddOldest(Time cur_time);
+      int AddOldest(Time cur_time, float avail_threshold);
       int AddHighAvailRateNodes(Time cur_time);
+      void UpdateAgeAvailStat(Time cur_time, int node_id);
+      void InitializeAgeAvailStat();
     protected:
       map<Time, vector<int>* > _alive_res;  //mpapping between registered time and worker nodes class
       map<int, map<int, Time>* > _prior_avail_frac;  //availability(1~100), node id, added_time
@@ -63,6 +65,9 @@ namespace VCHadoop{
       map<int, Time> _worker_registered_time;
       int _num_datanodes;
       Time _dn_softstate_time;
+      float _high_avail_threshold;
+      Time _youngest_age;
+      float _least_avail_rate;
       DataNodeSelectMode _datanode_selection_crit;
   };  
 } 
